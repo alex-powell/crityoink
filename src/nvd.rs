@@ -479,7 +479,7 @@ pub fn sync_from_nvd<H: HttpGet, S: Sleeper>(
     sleeper: &S,
     min_interval: Duration,
 ) -> Result<StoredDb> {
-    sync_from_nvd_with_page_size(http, sleeper, min_interval, RESULTS_PER_PAGE)
+    sync_from_nvd_with_page_size(http, sleeper, min_interval, RESULTS_PER_PAGE, Utc::now())
 }
 
 pub fn sync_from_nvd_with_page_size<H: HttpGet, S: Sleeper>(
@@ -487,6 +487,7 @@ pub fn sync_from_nvd_with_page_size<H: HttpGet, S: Sleeper>(
     sleeper: &S,
     min_interval: Duration,
     results_per_page: u32,
+    started_at: DateTime<Utc>,
 ) -> Result<StoredDb> {
     let mut by_id: HashMap<String, StoredCve> = HashMap::new();
     let mut rl = RateLimitState {
@@ -537,9 +538,10 @@ pub fn sync_from_nvd_with_page_size<H: HttpGet, S: Sleeper>(
         }
     }
 
-    let now = Utc::now();
-    let synced_at = now.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
-    let last_mod_end = format_last_mod(now);
+    // Watermark the *start* of the rebuild so the next lastMod window covers
+    // CVEs modified while these High/Critical streams were still running.
+    let last_mod_end = format_last_mod(started_at);
+    let synced_at = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
     let vulns: Vec<StoredCve> = by_id.into_values().collect();
     Ok(StoredDb::from_cves(
         NVD_BASE.to_string(),
@@ -581,7 +583,7 @@ pub fn refresh_from_nvd_with_page_size<H: HttpGet, S: Sleeper>(
             eprintln!(
                 "Full rebuild ({reason}): High/Critical severity streams, Rejected skipped, no inventory sent."
             );
-            sync_from_nvd_with_page_size(http, sleeper, min_interval, results_per_page)
+            sync_from_nvd_with_page_size(http, sleeper, min_interval, results_per_page, now)
         }
         SyncDecision::Incremental { start, end } => {
             let start_s = format_last_mod(start);
@@ -593,7 +595,13 @@ pub fn refresh_from_nvd_with_page_size<H: HttpGet, S: Sleeper>(
                 eprintln!(
                     "Incremental selected without a loaded DB; falling back to full rebuild."
                 );
-                return sync_from_nvd_with_page_size(http, sleeper, min_interval, results_per_page);
+                return sync_from_nvd_with_page_size(
+                    http,
+                    sleeper,
+                    min_interval,
+                    results_per_page,
+                    now,
+                );
             };
             match sync_incremental_with_page_size(
                 http,
@@ -609,7 +617,7 @@ pub fn refresh_from_nvd_with_page_size<H: HttpGet, S: Sleeper>(
                     eprintln!(
                         "NVD rejected the lastMod window ({e}); falling back to full rebuild."
                     );
-                    sync_from_nvd_with_page_size(http, sleeper, min_interval, results_per_page)
+                    sync_from_nvd_with_page_size(http, sleeper, min_interval, results_per_page, now)
                 }
                 Err(e) => Err(e),
             }
@@ -902,7 +910,8 @@ mod tests {
                 }]),
             );
         }
-        let db = sync_from_nvd_with_page_size(&client, &sleeper, Duration::ZERO, 1).unwrap();
+        let db =
+            sync_from_nvd_with_page_size(&client, &sleeper, Duration::ZERO, 1, Utc::now()).unwrap();
         assert_eq!(db.counts.total_stored, 1);
         assert_eq!(db.counts.high, 1);
         assert_eq!(db.vulnerabilities[0].id, "CVE-2020-0001");
@@ -934,8 +943,14 @@ mod tests {
                 body: empty_page(),
             },
         ]);
-        let _db =
-            sync_from_nvd_with_page_size(&client, &sleeper, Duration::from_millis(1), 1).unwrap();
+        let _db = sync_from_nvd_with_page_size(
+            &client,
+            &sleeper,
+            Duration::from_millis(1),
+            1,
+            Utc::now(),
+        )
+        .unwrap();
         let sleeps = sleeper.sleeps.borrow();
         assert!(
             sleeps.iter().any(|d| *d == Duration::from_secs(3)),
@@ -1265,7 +1280,33 @@ mod tests {
         assert!(urls.iter().any(|u| u.contains("cvssV3Severity")));
         assert!(urls.iter().all(|u| !u.contains("lastModStartDate")));
         assert!(urls.iter().all(|u| u.contains("noRejected")));
-        assert!(!db.last_mod_end.is_empty());
+        assert_eq!(db.last_mod_end, format_last_mod(now));
+        assert_eq!(db.last_mod_end, "2026-05-15T00:00:00.000");
+    }
+
+    #[test]
+    fn full_rebuild_stamps_last_mod_end_at_start_not_finish() {
+        let sleeper = RecSleeper {
+            sleeps: RefCell::new(Vec::new()),
+        };
+        let started = utc("2026-01-02T03:04:05.000");
+        let client = SeqClient::new(vec![]);
+        // Non-zero interval is recorded between streams; wall clock may move,
+        // but last_mod_end must stay the start timestamp, not a post-loop now.
+        let db =
+            sync_from_nvd_with_page_size(&client, &sleeper, Duration::from_millis(5), 1, started)
+                .unwrap();
+        assert_eq!(db.last_mod_end, format_last_mod(started));
+        assert_eq!(db.last_mod_end, "2026-01-02T03:04:05.000");
+        let synced = DateTime::parse_from_rfc3339(&db.synced_at)
+            .unwrap()
+            .with_timezone(&Utc);
+        assert!(
+            synced > started,
+            "synced_at should be finish time, got {}",
+            db.synced_at
+        );
+        assert_ne!(format_last_mod(Utc::now()), db.last_mod_end);
     }
 
     #[test]
@@ -1275,12 +1316,13 @@ mod tests {
         };
         let now = utc("2026-05-15T00:00:00.000");
         let client = SeqClient::new(vec![]);
-        let _db =
+        let db =
             refresh_from_nvd_with_page_size(&client, &sleeper, Duration::ZERO, 1, None, false, now)
                 .unwrap();
         let urls = client.urls.lock().unwrap();
         assert!(urls.iter().any(|u| u.contains("cvssV3Severity")));
         assert!(urls.iter().all(|u| !u.contains("lastModStartDate")));
+        assert_eq!(db.last_mod_end, format_last_mod(now));
     }
 
     #[test]

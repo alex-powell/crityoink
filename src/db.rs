@@ -9,9 +9,9 @@ use serde::{Deserialize, Serialize};
 use crate::error::{Error, Result};
 
 pub const DB_FILENAME: &str = "nvd.json";
-/// Current on-disk schema. Version 2 adds `last_mod_end` for incremental `--get`.
+/// Bump when `StoredDb` fields change.
 pub const SCHEMA_VERSION: u32 = 2;
-/// Incremental lastMod sync requires this schema (and a parseable `last_mod_end`).
+/// Incremental lastMod requires this schema and a non-empty `last_mod_end`.
 pub const MIN_INCREMENTAL_SCHEMA: u32 = 2;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
