@@ -172,6 +172,7 @@ mod tests {
         let db = StoredDb {
             schema_version: 1,
             synced_at: "2026-01-01T00:00:00Z".into(),
+            last_mod_end: String::new(),
             source: "https://services.nvd.nist.gov/rest/json/cves/2.0".into(),
             counts: Counts {
                 high: 0,

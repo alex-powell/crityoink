@@ -9,7 +9,10 @@ use serde::{Deserialize, Serialize};
 use crate::error::{Error, Result};
 
 pub const DB_FILENAME: &str = "nvd.json";
-pub const SCHEMA_VERSION: u32 = 1;
+/// Bump when `StoredDb` fields change.
+pub const SCHEMA_VERSION: u32 = 2;
+/// Incremental lastMod requires this schema and a non-empty `last_mod_end`.
+pub const MIN_INCREMENTAL_SCHEMA: u32 = 2;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Counts {
@@ -22,6 +25,9 @@ pub struct Counts {
 pub struct StoredDb {
     pub schema_version: u32,
     pub synced_at: String,
+    /// NVD `lastModEndDate` used on the last successful sync (watermark for incremental `--get`).
+    #[serde(default)]
+    pub last_mod_end: String,
     pub source: String,
     pub counts: Counts,
     pub vulnerabilities: Vec<StoredCve>,
@@ -77,7 +83,12 @@ pub struct CpeMatch {
 }
 
 impl StoredDb {
-    pub fn from_cves(source: String, synced_at: String, mut vulns: Vec<StoredCve>) -> Self {
+    pub fn from_cves(
+        source: String,
+        synced_at: String,
+        last_mod_end: String,
+        mut vulns: Vec<StoredCve>,
+    ) -> Self {
         vulns.sort_by(|a, b| a.id.cmp(&b.id));
         let high = vulns
             .iter()
@@ -91,6 +102,7 @@ impl StoredDb {
         Self {
             schema_version: SCHEMA_VERSION,
             synced_at,
+            last_mod_end,
             source,
             counts: Counts {
                 high,
@@ -99,6 +111,10 @@ impl StoredDb {
             },
             vulnerabilities: vulns,
         }
+    }
+
+    pub fn has_incremental_watermark(&self) -> bool {
+        self.schema_version >= MIN_INCREMENTAL_SCHEMA && !self.last_mod_end.trim().is_empty()
     }
 }
 
@@ -136,7 +152,7 @@ pub fn load(data_dir: &Path) -> Result<StoredDb> {
     Ok(db)
 }
 
-/// Atomically replace `nvd.json` with a complete new database (full refresh).
+/// Atomically replace `nvd.json` with a complete new database.
 pub fn save(data_dir: &Path, db: &StoredDb) -> Result<()> {
     fs::create_dir_all(data_dir)?;
     let dest = db_path(data_dir);
@@ -183,12 +199,14 @@ mod tests {
         let first = StoredDb::from_cves(
             "https://example.invalid/nvd".into(),
             "2020-01-01T00:00:00Z".into(),
+            "2020-01-01T00:00:00.000".into(),
             vec![sample_cve("CVE-2020-0001", "HIGH")],
         );
         save(dir.path(), &first).unwrap();
         let second = StoredDb::from_cves(
             "https://services.nvd.nist.gov/rest/json/cves/2.0".into(),
             "2026-01-02T03:04:05Z".into(),
+            "2026-01-02T03:04:05.000".into(),
             vec![
                 sample_cve("CVE-2021-44228", "CRITICAL"),
                 sample_cve("CVE-2024-0001", "HIGH"),
@@ -199,6 +217,8 @@ mod tests {
         let loaded = load(dir.path()).unwrap();
         assert_eq!(loaded.schema_version, SCHEMA_VERSION);
         assert_eq!(loaded.synced_at, "2026-01-02T03:04:05Z");
+        assert_eq!(loaded.last_mod_end, "2026-01-02T03:04:05.000");
+        assert!(loaded.has_incremental_watermark());
         assert_eq!(
             loaded.source,
             "https://services.nvd.nist.gov/rest/json/cves/2.0"
@@ -230,6 +250,7 @@ mod tests {
         let db = StoredDb::from_cves(
             "src".into(),
             "now".into(),
+            "now".into(),
             vec![sample_cve("CVE-1", "HIGH")],
         );
         save(dir.path(), &db).unwrap();
@@ -238,5 +259,22 @@ mod tests {
         f.read_to_string(&mut buf).unwrap();
         assert!(buf.contains("\"total_stored\":1") || buf.contains("\"total_stored\": 1"));
         let _parsed: serde_json::Value = serde_json::from_str(&buf).unwrap();
+    }
+
+    #[test]
+    fn old_schema_without_watermark_still_loads() {
+        let dir = tempfile::tempdir().unwrap();
+        let json = r#"{
+            "schema_version": 1,
+            "synced_at": "2026-01-01T00:00:00Z",
+            "source": "https://services.nvd.nist.gov/rest/json/cves/2.0",
+            "counts": {"high": 0, "critical": 0, "total_stored": 0},
+            "vulnerabilities": []
+        }"#;
+        std::fs::write(db_path(dir.path()), json).unwrap();
+        let loaded = load(dir.path()).unwrap();
+        assert_eq!(loaded.schema_version, 1);
+        assert!(loaded.last_mod_end.is_empty());
+        assert!(!loaded.has_incremental_watermark());
     }
 }

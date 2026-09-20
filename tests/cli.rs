@@ -42,6 +42,12 @@ fn help_exits_zero() {
     assert!(stdout.contains("--get"));
     assert!(stdout.contains("--check"));
     assert!(stdout.contains("--data-dir"));
+    assert!(stdout.contains("--full"));
+    let help = format!("{stdout}{stderr}").to_ascii_lowercase();
+    assert!(
+        help.contains("incremental") && help.contains("full"),
+        "help should describe incremental vs full, got {stdout}"
+    );
 }
 
 #[test]

@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::io::Read;
 use std::time::{Duration, Instant};
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, NaiveDateTime, Utc};
 use serde::Deserialize;
 
 use crate::db::{Configuration, StoredCve, StoredDb};
@@ -23,6 +23,86 @@ pub const QUERY_STREAMS: &[(&str, &str)] = &[
     ("cvssV4Severity", "HIGH"),
     ("cvssV2Severity", "HIGH"),
 ];
+
+/// NVD lastMod windows are capped at 120 consecutive days.
+pub const LAST_MOD_MAX_DAYS: i64 = 120;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SyncDecision {
+    FullRebuild {
+        reason: &'static str,
+    },
+    Incremental {
+        start: DateTime<Utc>,
+        end: DateTime<Utc>,
+    },
+}
+
+/// Format a UTC timestamp the way NVD 2.0 lastMod parameters expect.
+pub fn format_last_mod(dt: DateTime<Utc>) -> String {
+    dt.format("%Y-%m-%dT%H:%M:%S%.3f").to_string()
+}
+
+/// Parse a stored watermark or NVD lastMod timestamp.
+pub fn parse_last_mod(s: &str) -> Option<DateTime<Utc>> {
+    let s = s.trim();
+    if s.is_empty() {
+        return None;
+    }
+    if let Ok(dt) = DateTime::parse_from_rfc3339(s) {
+        return Some(dt.with_timezone(&Utc));
+    }
+    for fmt in [
+        "%Y-%m-%dT%H:%M:%S%.3f",
+        "%Y-%m-%dT%H:%M:%S%.f",
+        "%Y-%m-%dT%H:%M:%S",
+    ] {
+        if let Ok(naive) = NaiveDateTime::parse_from_str(s, fmt) {
+            return Some(naive.and_utc());
+        }
+    }
+    None
+}
+
+pub fn last_mod_window_too_old(start: DateTime<Utc>, end: DateTime<Utc>) -> bool {
+    end.signed_duration_since(start).num_seconds() > LAST_MOD_MAX_DAYS * 86_400
+}
+
+pub fn decide_sync(
+    existing: Option<&StoredDb>,
+    force_full: bool,
+    now: DateTime<Utc>,
+) -> SyncDecision {
+    if force_full {
+        return SyncDecision::FullRebuild { reason: "--full" };
+    }
+    let Some(db) = existing else {
+        return SyncDecision::FullRebuild {
+            reason: "no local database",
+        };
+    };
+    if !db.has_incremental_watermark() {
+        return SyncDecision::FullRebuild {
+            reason: "missing last-mod watermark or old schema",
+        };
+    }
+    let Some(start) = parse_last_mod(&db.last_mod_end) else {
+        return SyncDecision::FullRebuild {
+            reason: "unreadable last-mod watermark",
+        };
+    };
+    if start > now {
+        return SyncDecision::FullRebuild {
+            reason: "last-mod watermark is in the future",
+        };
+    }
+    if last_mod_window_too_old(start, now) {
+        return SyncDecision::FullRebuild {
+            reason: "last-mod watermark is older than NVD's 120-day window",
+        };
+    }
+    SyncDecision::Incremental { start, end: now }
+}
 
 #[derive(Debug, Clone)]
 pub struct HttpResponse {
@@ -155,6 +235,18 @@ pub fn build_url(
     )
 }
 
+/// lastMod delta: no severity filter and no `noRejected`, so demotions and Rejected CVEs appear.
+pub fn build_last_mod_url(
+    last_mod_start: &str,
+    last_mod_end: &str,
+    start_index: u32,
+    results_per_page: u32,
+) -> String {
+    format!(
+        "{NVD_BASE}?lastModStartDate={last_mod_start}&lastModEndDate={last_mod_end}&startIndex={start_index}&resultsPerPage={results_per_page}"
+    )
+}
+
 pub fn url_is_inventory_free(url: &str) -> bool {
     let lower = url.to_ascii_lowercase();
     !lower.contains("cpename=")
@@ -262,22 +354,31 @@ pub fn ingest_cve_json(value: &serde_json::Value) -> Result<Option<StoredCve>> {
     Ok(ingest_api_cve(&cve))
 }
 
-fn ingest_api_cve(cve: &ApiCve) -> Option<StoredCve> {
+enum DeltaAction {
+    /// High/Critical, not Rejected, has configurations → insert or replace.
+    Upsert(StoredCve),
+    /// Rejected or dropped below High/Critical → delete from the local DB if present.
+    Remove(String),
+    /// Empty id or no configurations: do not insert and do not delete.
+    Ignore,
+}
+
+fn delta_action(cve: &ApiCve) -> DeltaAction {
     if cve.id.trim().is_empty() {
-        return None;
+        return DeltaAction::Ignore;
     }
     if is_rejected_status(cve.vuln_status.as_deref().unwrap_or("")) {
-        return None;
+        return DeltaAction::Remove(cve.id.clone());
     }
     let (severity, score) =
         extract_severity(cve.metrics.as_ref().unwrap_or(&ApiMetrics::default()));
     if !crate::cpe::is_high_or_critical(&severity) {
-        return None;
+        return DeltaAction::Remove(cve.id.clone());
     }
     if cve.configurations.is_empty() {
-        return None;
+        return DeltaAction::Ignore;
     }
-    Some(StoredCve {
+    DeltaAction::Upsert(StoredCve {
         id: cve.id.clone(),
         severity,
         score,
@@ -285,6 +386,25 @@ fn ingest_api_cve(cve: &ApiCve) -> Option<StoredCve> {
         description: english_description(&cve.descriptions),
         configurations: cve.configurations.clone(),
     })
+}
+
+fn ingest_api_cve(cve: &ApiCve) -> Option<StoredCve> {
+    match delta_action(cve) {
+        DeltaAction::Upsert(stored) => Some(stored),
+        DeltaAction::Remove(_) | DeltaAction::Ignore => None,
+    }
+}
+
+fn apply_delta_cve(by_id: &mut HashMap<String, StoredCve>, cve: &ApiCve) {
+    match delta_action(cve) {
+        DeltaAction::Upsert(stored) => {
+            by_id.insert(stored.id.clone(), stored);
+        }
+        DeltaAction::Remove(id) => {
+            by_id.remove(&id);
+        }
+        DeltaAction::Ignore => {}
+    }
 }
 
 struct RateLimitState {
@@ -359,7 +479,7 @@ pub fn sync_from_nvd<H: HttpGet, S: Sleeper>(
     sleeper: &S,
     min_interval: Duration,
 ) -> Result<StoredDb> {
-    sync_from_nvd_with_page_size(http, sleeper, min_interval, RESULTS_PER_PAGE)
+    sync_from_nvd_with_page_size(http, sleeper, min_interval, RESULTS_PER_PAGE, Utc::now())
 }
 
 pub fn sync_from_nvd_with_page_size<H: HttpGet, S: Sleeper>(
@@ -367,6 +487,7 @@ pub fn sync_from_nvd_with_page_size<H: HttpGet, S: Sleeper>(
     sleeper: &S,
     min_interval: Duration,
     results_per_page: u32,
+    started_at: DateTime<Utc>,
 ) -> Result<StoredDb> {
     let mut by_id: HashMap<String, StoredCve> = HashMap::new();
     let mut rl = RateLimitState {
@@ -417,9 +538,166 @@ pub fn sync_from_nvd_with_page_size<H: HttpGet, S: Sleeper>(
         }
     }
 
+    // Watermark the *start* of the rebuild so the next lastMod window covers
+    // CVEs modified while these High/Critical streams were still running.
+    let last_mod_end = format_last_mod(started_at);
     let synced_at = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
     let vulns: Vec<StoredCve> = by_id.into_values().collect();
-    Ok(StoredDb::from_cves(NVD_BASE.to_string(), synced_at, vulns))
+    Ok(StoredDb::from_cves(
+        NVD_BASE.to_string(),
+        synced_at,
+        last_mod_end,
+        vulns,
+    ))
+}
+
+pub fn refresh_from_nvd<H: HttpGet, S: Sleeper>(
+    http: &H,
+    sleeper: &S,
+    min_interval: Duration,
+    existing: Option<StoredDb>,
+    force_full: bool,
+) -> Result<StoredDb> {
+    refresh_from_nvd_with_page_size(
+        http,
+        sleeper,
+        min_interval,
+        RESULTS_PER_PAGE,
+        existing,
+        force_full,
+        Utc::now(),
+    )
+}
+
+pub fn refresh_from_nvd_with_page_size<H: HttpGet, S: Sleeper>(
+    http: &H,
+    sleeper: &S,
+    min_interval: Duration,
+    results_per_page: u32,
+    existing: Option<StoredDb>,
+    force_full: bool,
+    now: DateTime<Utc>,
+) -> Result<StoredDb> {
+    match decide_sync(existing.as_ref(), force_full, now) {
+        SyncDecision::FullRebuild { reason } => {
+            eprintln!(
+                "Full rebuild ({reason}): High/Critical severity streams, Rejected skipped, no inventory sent."
+            );
+            sync_from_nvd_with_page_size(http, sleeper, min_interval, results_per_page, now)
+        }
+        SyncDecision::Incremental { start, end } => {
+            let start_s = format_last_mod(start);
+            let end_s = format_last_mod(end);
+            eprintln!(
+                "Incremental lastMod sync {start_s} .. {end_s} (all statuses/severities so demotions and Rejected are visible; no inventory sent)."
+            );
+            let Some(existing) = existing else {
+                eprintln!(
+                    "Incremental selected without a loaded DB; falling back to full rebuild."
+                );
+                return sync_from_nvd_with_page_size(
+                    http,
+                    sleeper,
+                    min_interval,
+                    results_per_page,
+                    now,
+                );
+            };
+            match sync_incremental_with_page_size(
+                http,
+                sleeper,
+                min_interval,
+                results_per_page,
+                existing,
+                start,
+                end,
+            ) {
+                Ok(db) => Ok(db),
+                Err(e) if last_mod_window_rejected(&e) => {
+                    eprintln!(
+                        "NVD rejected the lastMod window ({e}); falling back to full rebuild."
+                    );
+                    sync_from_nvd_with_page_size(http, sleeper, min_interval, results_per_page, now)
+                }
+                Err(e) => Err(e),
+            }
+        }
+    }
+}
+
+fn last_mod_window_rejected(err: &Error) -> bool {
+    matches!(err, Error::Http(msg) if msg.contains("lastMod") && msg.contains("400"))
+}
+
+pub fn sync_incremental_with_page_size<H: HttpGet, S: Sleeper>(
+    http: &H,
+    sleeper: &S,
+    min_interval: Duration,
+    results_per_page: u32,
+    existing: StoredDb,
+    start: DateTime<Utc>,
+    end: DateTime<Utc>,
+) -> Result<StoredDb> {
+    let mut by_id: HashMap<String, StoredCve> = existing
+        .vulnerabilities
+        .into_iter()
+        .map(|c| (c.id.clone(), c))
+        .collect();
+    let mut rl = RateLimitState {
+        min_interval,
+        last: None,
+    };
+    let start_s = format_last_mod(start);
+    let end_s = format_last_mod(end);
+    eprintln!("Fetching lastMod {start_s} .. {end_s} from NVD…");
+    let mut start_index = 0u32;
+    loop {
+        let url = build_last_mod_url(&start_s, &end_s, start_index, results_per_page);
+        debug_assert!(url_is_inventory_free(&url));
+        debug_assert!(!url.contains("noRejected"));
+        let resp = request_with_retry(http, sleeper, &url, &mut rl)?;
+        if resp.status == 400 {
+            return Err(Error::Http(format!(
+                "NVD lastMod window rejected (HTTP 400) for {url}"
+            )));
+        }
+        if resp.status != 200 {
+            return Err(Error::Http(format!("NVD HTTP {} for {url}", resp.status)));
+        }
+        let page: ApiPage = serde_json::from_str(&resp.body).map_err(|e| {
+            Error::msg(format!(
+                "Failed to parse NVD JSON at startIndex={start_index}: {e}"
+            ))
+        })?;
+        eprintln!(
+            "  startIndex={start_index} resultsPerPage={} totalResults={}",
+            page.results_per_page, page.total_results
+        );
+        for item in &page.vulnerabilities {
+            apply_delta_cve(&mut by_id, &item.cve);
+        }
+        if page.vulnerabilities.is_empty() {
+            break;
+        }
+        let step = if page.results_per_page > 0 {
+            page.results_per_page
+        } else {
+            page.vulnerabilities.len() as u32
+        };
+        start_index = start_index.saturating_add(step);
+        if start_index >= page.total_results {
+            break;
+        }
+    }
+
+    let synced_at = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let vulns: Vec<StoredCve> = by_id.into_values().collect();
+    Ok(StoredDb::from_cves(
+        NVD_BASE.to_string(),
+        synced_at,
+        end_s,
+        vulns,
+    ))
 }
 
 #[cfg(test)]
@@ -632,15 +910,20 @@ mod tests {
                 }]),
             );
         }
-        let db = sync_from_nvd_with_page_size(&client, &sleeper, Duration::ZERO, 1).unwrap();
+        let db =
+            sync_from_nvd_with_page_size(&client, &sleeper, Duration::ZERO, 1, Utc::now()).unwrap();
         assert_eq!(db.counts.total_stored, 1);
         assert_eq!(db.counts.high, 1);
         assert_eq!(db.vulnerabilities[0].id, "CVE-2020-0001");
         assert_eq!(db.source, NVD_BASE);
         assert!(!db.synced_at.is_empty());
+        assert!(!db.last_mod_end.is_empty());
+        assert_eq!(db.schema_version, crate::db::SCHEMA_VERSION);
         let urls = client.urls.lock().unwrap();
         assert!(urls.iter().all(|u| url_is_inventory_free(u)));
         assert!(urls.iter().any(|u| u.contains("startIndex=1")));
+        assert!(urls.iter().all(|u| u.contains("noRejected")));
+        assert!(!urls.iter().any(|u| u.contains("noRejected=")));
     }
 
     #[test]
@@ -660,8 +943,14 @@ mod tests {
                 body: empty_page(),
             },
         ]);
-        let _db =
-            sync_from_nvd_with_page_size(&client, &sleeper, Duration::from_millis(1), 1).unwrap();
+        let _db = sync_from_nvd_with_page_size(
+            &client,
+            &sleeper,
+            Duration::from_millis(1),
+            1,
+            Utc::now(),
+        )
+        .unwrap();
         let sleeps = sleeper.sleeps.borrow();
         assert!(
             sleeps.iter().any(|d| *d == Duration::from_secs(3)),
@@ -685,5 +974,392 @@ mod tests {
         assert_eq!(sleeps.len(), 1);
         assert!(sleeps[0] >= Duration::from_millis(7400));
         assert!(sleeps[0] <= Duration::from_millis(7500));
+    }
+
+    fn apply_one(map: &mut HashMap<String, StoredCve>, json: &str) {
+        let v: serde_json::Value = serde_json::from_str(json).unwrap();
+        let cve: ApiCve = serde_json::from_value(v.get("cve").unwrap().clone()).unwrap();
+        apply_delta_cve(map, &cve);
+    }
+
+    fn seed_map(ids: &[(&str, &str)]) -> HashMap<String, StoredCve> {
+        ids.iter()
+            .map(|(id, sev)| {
+                let score = if *sev == "CRITICAL" { 9.8 } else { 7.5 };
+                let json = high_cve_json(id, "Analyzed", sev, score, "foo");
+                let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+                let stored = ingest_cve_json(v.get("cve").unwrap()).unwrap().unwrap();
+                (stored.id.clone(), stored)
+            })
+            .collect()
+    }
+
+    fn utc(s: &str) -> DateTime<Utc> {
+        parse_last_mod(s).unwrap()
+    }
+
+    #[test]
+    fn last_mod_format_roundtrip() {
+        let dt = utc("2026-05-01T12:34:56.000");
+        assert_eq!(format_last_mod(dt), "2026-05-01T12:34:56.000");
+        assert_eq!(
+            parse_last_mod("2026-05-01T12:34:56Z").unwrap(),
+            utc("2026-05-01T12:34:56.000")
+        );
+        assert!(parse_last_mod("").is_none());
+        assert!(parse_last_mod("bogus").is_none());
+    }
+
+    #[test]
+    fn incremental_last_mod_url_has_no_severity_or_norejected() {
+        let url = build_last_mod_url(
+            "2026-01-01T00:00:00.000",
+            "2026-01-02T00:00:00.000",
+            0,
+            2000,
+        );
+        assert!(url.starts_with(NVD_BASE));
+        assert!(url.contains("lastModStartDate=2026-01-01T00:00:00.000"));
+        assert!(url.contains("lastModEndDate=2026-01-02T00:00:00.000"));
+        assert!(url.contains("startIndex=0"));
+        assert!(url.contains("resultsPerPage=2000"));
+        assert!(!url.contains("noRejected"));
+        assert!(!url.contains("cvssV3Severity"));
+        assert!(!url.contains("cvssV4Severity"));
+        assert!(!url.contains("cvssV2Severity"));
+        assert!(url_is_inventory_free(&url));
+    }
+
+    #[test]
+    fn delta_upserts_still_high_or_critical() {
+        let mut map = seed_map(&[("CVE-2020-KEEP", "HIGH")]);
+        apply_one(
+            &mut map,
+            &high_cve_json("CVE-2020-KEEP", "Analyzed", "CRITICAL", 9.8, "updated"),
+        );
+        let stored = map.get("CVE-2020-KEEP").expect("still present");
+        assert_eq!(stored.severity, "CRITICAL");
+        assert_eq!(stored.score, Some(9.8));
+        assert_eq!(map.len(), 1);
+    }
+
+    #[test]
+    fn delta_inserts_upgrade_to_high_critical() {
+        let mut map = seed_map(&[("CVE-2020-KEEP", "HIGH")]);
+        apply_one(
+            &mut map,
+            &high_cve_json("CVE-2020-NEW", "Analyzed", "HIGH", 7.5, "newp"),
+        );
+        assert!(map.contains_key("CVE-2020-NEW"));
+        assert!(map.contains_key("CVE-2020-KEEP"));
+        assert_eq!(map["CVE-2020-NEW"].severity, "HIGH");
+        assert_eq!(map.len(), 2);
+    }
+
+    #[test]
+    fn delta_removes_rejected() {
+        let mut map = seed_map(&[
+            ("CVE-2020-REJ", "HIGH"),
+            ("CVE-2020-REJR", "CRITICAL"),
+            ("CVE-2020-KEEP", "HIGH"),
+        ]);
+        apply_one(
+            &mut map,
+            &high_cve_json("CVE-2020-REJ", "Rejected", "HIGH", 7.5, "foo"),
+        );
+        apply_one(
+            &mut map,
+            &high_cve_json("CVE-2020-REJR", "Rejected-related", "CRITICAL", 9.8, "foo"),
+        );
+        assert!(!map.contains_key("CVE-2020-REJ"));
+        assert!(!map.contains_key("CVE-2020-REJR"));
+        assert!(map.contains_key("CVE-2020-KEEP"));
+    }
+
+    #[test]
+    fn delta_removes_demotion_below_high() {
+        let mut map = seed_map(&[("CVE-2020-DEM", "CRITICAL"), ("CVE-2020-KEEP", "HIGH")]);
+        apply_one(
+            &mut map,
+            &high_cve_json("CVE-2020-DEM", "Analyzed", "MEDIUM", 5.0, "foo"),
+        );
+        assert!(!map.contains_key("CVE-2020-DEM"));
+        assert!(map.contains_key("CVE-2020-KEEP"));
+    }
+
+    #[test]
+    fn delta_leaves_unrelated_local_entries() {
+        let mut map = seed_map(&[("CVE-2020-STAY", "HIGH"), ("CVE-2020-KEEP", "HIGH")]);
+        apply_one(
+            &mut map,
+            &high_cve_json("CVE-2020-KEEP", "Analyzed", "HIGH", 8.1, "foo"),
+        );
+        assert!(map.contains_key("CVE-2020-STAY"));
+        assert_eq!(map["CVE-2020-KEEP"].score, Some(8.1));
+        assert_eq!(map.len(), 2);
+    }
+
+    #[test]
+    fn decide_sync_full_rebuild_fallbacks() {
+        let now = utc("2026-06-01T00:00:00.000");
+        assert!(matches!(
+            decide_sync(None, false, now),
+            SyncDecision::FullRebuild {
+                reason: "no local database"
+            }
+        ));
+        assert!(matches!(
+            decide_sync(None, true, now),
+            SyncDecision::FullRebuild { reason: "--full" }
+        ));
+
+        let mut db = StoredDb::from_cves(
+            NVD_BASE.into(),
+            "2026-05-01T00:00:00Z".into(),
+            "2026-05-01T00:00:00.000".into(),
+            vec![],
+        );
+        assert!(matches!(
+            decide_sync(Some(&db), true, now),
+            SyncDecision::FullRebuild { reason: "--full" }
+        ));
+
+        db.last_mod_end.clear();
+        assert!(matches!(
+            decide_sync(Some(&db), false, now),
+            SyncDecision::FullRebuild { .. }
+        ));
+
+        db.last_mod_end = "2026-05-01T00:00:00.000".into();
+        db.schema_version = 1;
+        assert!(matches!(
+            decide_sync(Some(&db), false, now),
+            SyncDecision::FullRebuild { .. }
+        ));
+
+        db.schema_version = crate::db::SCHEMA_VERSION;
+        db.last_mod_end = "not-a-date".into();
+        assert!(matches!(
+            decide_sync(Some(&db), false, now),
+            SyncDecision::FullRebuild { .. }
+        ));
+
+        db.last_mod_end = "2026-01-01T00:00:00.000".into();
+        assert!(matches!(
+            decide_sync(Some(&db), false, now),
+            SyncDecision::FullRebuild {
+                reason: "last-mod watermark is older than NVD's 120-day window"
+            }
+        ));
+
+        db.last_mod_end = "2026-05-01T00:00:00.000".into();
+        match decide_sync(Some(&db), false, now) {
+            SyncDecision::Incremental { start, end } => {
+                assert_eq!(format_last_mod(start), "2026-05-01T00:00:00.000");
+                assert_eq!(end, now);
+            }
+            other => panic!("expected incremental, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn incremental_sync_merges_pages_and_sets_watermark() {
+        let sleeper = RecSleeper {
+            sleeps: RefCell::new(Vec::new()),
+        };
+        let existing = StoredDb::from_cves(
+            NVD_BASE.into(),
+            "2026-01-01T00:00:00Z".into(),
+            "2026-01-01T00:00:00.000".into(),
+            seed_map(&[
+                ("CVE-2020-KEEP", "HIGH"),
+                ("CVE-2020-REJ", "HIGH"),
+                ("CVE-2020-DEM", "CRITICAL"),
+                ("CVE-2020-STAY", "HIGH"),
+            ])
+            .into_values()
+            .collect(),
+        );
+        let start = utc("2026-01-01T00:00:00.000");
+        let end = utc("2026-01-10T00:00:00.000");
+        let client = SeqClient::new(vec![
+            HttpResponse {
+                status: 200,
+                retry_after: None,
+                body: page_json(
+                    0,
+                    4,
+                    &high_cve_json("CVE-2020-KEEP", "Analyzed", "CRITICAL", 9.8, "keep"),
+                ),
+            },
+            HttpResponse {
+                status: 200,
+                retry_after: None,
+                body: page_json(
+                    1,
+                    4,
+                    &high_cve_json("CVE-2020-NEW", "Analyzed", "HIGH", 7.5, "newp"),
+                ),
+            },
+            HttpResponse {
+                status: 200,
+                retry_after: None,
+                body: page_json(
+                    2,
+                    4,
+                    &high_cve_json("CVE-2020-REJ", "Rejected", "HIGH", 7.5, "rej"),
+                ),
+            },
+            HttpResponse {
+                status: 200,
+                retry_after: None,
+                body: page_json(
+                    3,
+                    4,
+                    &high_cve_json("CVE-2020-DEM", "Analyzed", "LOW", 2.0, "dem"),
+                ),
+            },
+        ]);
+        let db = sync_incremental_with_page_size(
+            &client,
+            &sleeper,
+            Duration::ZERO,
+            1,
+            existing,
+            start,
+            end,
+        )
+        .unwrap();
+        let ids: Vec<_> = db.vulnerabilities.iter().map(|v| v.id.as_str()).collect();
+        assert!(ids.contains(&"CVE-2020-KEEP"));
+        assert!(ids.contains(&"CVE-2020-NEW"));
+        assert!(ids.contains(&"CVE-2020-STAY"));
+        assert!(!ids.contains(&"CVE-2020-REJ"));
+        assert!(!ids.contains(&"CVE-2020-DEM"));
+        let keep = db
+            .vulnerabilities
+            .iter()
+            .find(|v| v.id == "CVE-2020-KEEP")
+            .unwrap();
+        assert_eq!(keep.severity, "CRITICAL");
+        assert_eq!(db.last_mod_end, "2026-01-10T00:00:00.000");
+        assert_eq!(db.counts.total_stored, 3);
+        let urls = client.urls.lock().unwrap();
+        assert!(urls.iter().all(|u| u.contains("lastModStartDate=")));
+        assert!(urls.iter().all(|u| u.contains("lastModEndDate=")));
+        assert!(urls.iter().all(|u| !u.contains("noRejected")));
+        assert!(urls.iter().all(|u| !u.contains("cvssV3Severity")));
+        assert!(urls.iter().all(|u| url_is_inventory_free(u)));
+        assert!(urls.iter().any(|u| u.contains("startIndex=1")));
+    }
+
+    #[test]
+    fn refresh_force_full_uses_severity_streams() {
+        let sleeper = RecSleeper {
+            sleeps: RefCell::new(Vec::new()),
+        };
+        let existing = StoredDb::from_cves(
+            NVD_BASE.into(),
+            "2026-05-01T00:00:00Z".into(),
+            "2026-05-01T00:00:00.000".into(),
+            vec![],
+        );
+        let now = utc("2026-05-15T00:00:00.000");
+        let client = SeqClient::new(vec![]);
+        let db = refresh_from_nvd_with_page_size(
+            &client,
+            &sleeper,
+            Duration::ZERO,
+            1,
+            Some(existing),
+            true,
+            now,
+        )
+        .unwrap();
+        let urls = client.urls.lock().unwrap();
+        assert!(urls.iter().any(|u| u.contains("cvssV3Severity")));
+        assert!(urls.iter().all(|u| !u.contains("lastModStartDate")));
+        assert!(urls.iter().all(|u| u.contains("noRejected")));
+        assert_eq!(db.last_mod_end, format_last_mod(now));
+        assert_eq!(db.last_mod_end, "2026-05-15T00:00:00.000");
+    }
+
+    #[test]
+    fn full_rebuild_stamps_last_mod_end_at_start_not_finish() {
+        let sleeper = RecSleeper {
+            sleeps: RefCell::new(Vec::new()),
+        };
+        let started = utc("2026-01-02T03:04:05.000");
+        let client = SeqClient::new(vec![]);
+        // Non-zero interval is recorded between streams; wall clock may move,
+        // but last_mod_end must stay the start timestamp, not a post-loop now.
+        let db =
+            sync_from_nvd_with_page_size(&client, &sleeper, Duration::from_millis(5), 1, started)
+                .unwrap();
+        assert_eq!(db.last_mod_end, format_last_mod(started));
+        assert_eq!(db.last_mod_end, "2026-01-02T03:04:05.000");
+        let synced = DateTime::parse_from_rfc3339(&db.synced_at)
+            .unwrap()
+            .with_timezone(&Utc);
+        assert!(
+            synced > started,
+            "synced_at should be finish time, got {}",
+            db.synced_at
+        );
+        assert_ne!(format_last_mod(Utc::now()), db.last_mod_end);
+    }
+
+    #[test]
+    fn refresh_without_db_is_full_rebuild() {
+        let sleeper = RecSleeper {
+            sleeps: RefCell::new(Vec::new()),
+        };
+        let now = utc("2026-05-15T00:00:00.000");
+        let client = SeqClient::new(vec![]);
+        let db =
+            refresh_from_nvd_with_page_size(&client, &sleeper, Duration::ZERO, 1, None, false, now)
+                .unwrap();
+        let urls = client.urls.lock().unwrap();
+        assert!(urls.iter().any(|u| u.contains("cvssV3Severity")));
+        assert!(urls.iter().all(|u| !u.contains("lastModStartDate")));
+        assert_eq!(db.last_mod_end, format_last_mod(now));
+    }
+
+    #[test]
+    fn refresh_with_watermark_uses_last_mod() {
+        let sleeper = RecSleeper {
+            sleeps: RefCell::new(Vec::new()),
+        };
+        let existing = StoredDb::from_cves(
+            NVD_BASE.into(),
+            "2026-05-01T00:00:00Z".into(),
+            "2026-05-01T00:00:00.000".into(),
+            vec![],
+        );
+        let now = utc("2026-05-15T00:00:00.000");
+        let client = SeqClient::new(vec![HttpResponse {
+            status: 200,
+            retry_after: None,
+            body: empty_page(),
+        }]);
+        let db = refresh_from_nvd_with_page_size(
+            &client,
+            &sleeper,
+            Duration::ZERO,
+            1,
+            Some(existing),
+            false,
+            now,
+        )
+        .unwrap();
+        let urls = client.urls.lock().unwrap();
+        assert!(urls
+            .iter()
+            .all(|u| u.contains("lastModStartDate=2026-05-01T00:00:00.000")));
+        assert!(urls
+            .iter()
+            .all(|u| u.contains("lastModEndDate=2026-05-15T00:00:00.000")));
+        assert!(urls.iter().all(|u| !u.contains("noRejected")));
+        assert_eq!(db.last_mod_end, "2026-05-15T00:00:00.000");
     }
 }
