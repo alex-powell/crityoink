@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::io::Read;
 use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
@@ -66,7 +67,8 @@ impl HttpGet for UreqClient {
 fn read_ureq(resp: ureq::Response) -> Result<HttpResponse> {
     let status = resp.status();
     let retry_after = resp.header("retry-after").map(str::to_string);
-    let body = resp.into_string().unwrap_or_default();
+    let mut body = String::new();
+    resp.into_reader().read_to_string(&mut body)?;
     Ok(HttpResponse {
         status,
         retry_after,
