@@ -149,7 +149,7 @@ pub fn build_url(
     results_per_page: u32,
 ) -> String {
     format!(
-        "{NVD_BASE}?{sev_param}={sev_value}&noRejected=true&startIndex={start_index}&resultsPerPage={results_per_page}"
+        "{NVD_BASE}?{sev_param}={sev_value}&noRejected&startIndex={start_index}&resultsPerPage={results_per_page}"
     )
 }
 
@@ -528,7 +528,7 @@ mod tests {
         let url = build_url("cvssV3Severity", "HIGH", 0, 2000);
         assert!(url.starts_with(NVD_BASE));
         assert!(url.contains("cvssV3Severity=HIGH"));
-        assert!(url.contains("noRejected=true"));
+        assert!(url.contains("noRejected"));
         assert!(url.contains("startIndex=0"));
         assert!(url.contains("resultsPerPage=2000"));
         assert!(url_is_inventory_free(&url));
