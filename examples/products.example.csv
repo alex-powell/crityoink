@@ -1,0 +1,4 @@
+name,owner,cpe
+OpenSSL 3.0.13,platform,cpe:2.3:a:openssl:openssl:3.0.13:*:*:*:*:*:*:*
+Log4j 2.14.1,app,cpe:2.3:a:apache:log4j:2.14.1:*:*:*:*:*:*:*
+Windows Server 2019,endpoint,cpe:2.3:o:microsoft:windows_server_2019:-:*:*:*:*:*:*:*

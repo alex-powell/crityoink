@@ -1,0 +1,83 @@
+{
+  "schema_version": 1,
+  "synced_at": "2026-01-01T00:00:00Z",
+  "source": "https://services.nvd.nist.gov/rest/json/cves/2.0",
+  "counts": {
+    "high": 1,
+    "critical": 1,
+    "total_stored": 2
+  },
+  "vulnerabilities": [
+    {
+      "id": "CVE-2021-44228",
+      "severity": "CRITICAL",
+      "score": 10.0,
+      "published": "2021-12-10",
+      "description": "Apache Log4j2 JNDI features used in configuration, log messages, and parameters do not protect against attacker controlled LDAP and other JNDI related endpoints.",
+      "configurations": [
+        {
+          "nodes": [
+            {
+              "operator": "OR",
+              "negate": false,
+              "cpeMatch": [
+                {
+                  "vulnerable": true,
+                  "criteria": "cpe:2.3:a:apache:log4j:*:*:*:*:*:*:*:*",
+                  "versionStartIncluding": "2.0",
+                  "versionEndExcluding": "2.15.0"
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "CVE-2024-TEST-OPENSSL",
+      "severity": "HIGH",
+      "score": 7.5,
+      "published": "2024-01-15",
+      "description": "Test fixture: OpenSSL 3.0.13 configuration match.",
+      "configurations": [
+        {
+          "nodes": [
+            {
+              "operator": "OR",
+              "negate": false,
+              "cpeMatch": [
+                {
+                  "vulnerable": true,
+                  "criteria": "cpe:2.3:a:openssl:openssl:3.0.13:*:*:*:*:*:*:*"
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "CVE-2020-MEDIUM",
+      "severity": "MEDIUM",
+      "score": 5.3,
+      "published": "2020-06-01",
+      "description": "Should never be reported; Low/Medium must not match.",
+      "configurations": [
+        {
+          "nodes": [
+            {
+              "operator": "OR",
+              "negate": false,
+              "cpeMatch": [
+                {
+                  "vulnerable": true,
+                  "criteria": "cpe:2.3:a:apache:log4j:2.14.1:*:*:*:*:*:*:*"
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,3 @@
+name,owner,cpe
+Nothing Burger,lab,cpe:2.3:a:example:not_a_real_product:1.0:*:*:*:*:*:*:*
+Legacy Miss,lab,cpe:/a:example:also_missing:9.9
