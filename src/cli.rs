@@ -3,16 +3,17 @@ use std::path::PathBuf;
 
 use clap::{Parser, ValueHint};
 
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::{cpe, csv_inv, db, html, nvd};
 
 const USAGE: &str = "\
 Specify exactly one of --get or --check <csv>.
 
 Usage:
-  crityoink --get [--data-dir DIR]
+  crityoink --get [--full] [--data-dir DIR]
   crityoink --check CSV [--data-dir DIR] [--out FILE]
 
+--get is incremental lastMod when a watermark exists; --get --full forces a rebuild.
 Your CPE inventory is never sent to NVD. --check uses the local database only.";
 
 #[derive(Parser, Debug)]
@@ -23,9 +24,13 @@ Your CPE inventory is never sent to NVD. --check uses the local database only.";
     long_about = "crityoink mirrors High and Critical CVEs from the NVD REST API into a local JSON database, then matches a local CPE inventory CSV without any network access.\n\nThe inventory CSV is never sent to NVD.\nA CPE match is not a claim that a CVE is exploited."
 )]
 pub struct Cli {
-    /// Talk to the NVD REST API (no API key) and fully rebuild the local JSON database
+    /// Update the local JSON database from NVD (incremental lastMod delta, or full rebuild)
     #[arg(long)]
     pub get: bool,
+
+    /// With --get, force a full High/Critical rebuild instead of an incremental lastMod delta
+    #[arg(long, requires = "get")]
+    pub full: bool,
 
     /// Match inventory CPEs against the local JSON database only and write an HTML report
     #[arg(long, value_name = "CSV", value_hint = ValueHint::FilePath)]
@@ -68,7 +73,7 @@ where
     };
 
     match (cli.get, cli.check.as_ref()) {
-        (true, None) => cmd_get(cli.data_dir.as_ref()),
+        (true, None) => cmd_get(cli.data_dir.as_ref(), cli.full),
         (false, Some(csv)) => cmd_check(csv, cli.data_dir.as_ref(), cli.out.as_ref()),
         (true, Some(_)) | (false, None) => {
             eprintln!("{USAGE}");
@@ -81,22 +86,29 @@ fn resolve_data_dir(explicit: Option<&PathBuf>) -> PathBuf {
     explicit.cloned().unwrap_or_else(db::default_data_dir)
 }
 
-fn cmd_get(data_dir: Option<&PathBuf>) -> Result<i32> {
+fn cmd_get(data_dir: Option<&PathBuf>, force_full: bool) -> Result<i32> {
     let data_dir = resolve_data_dir(data_dir);
-    eprintln!(
-        "Refreshing local NVD database in {} (full rebuild, High + Critical only, Rejected skipped).",
-        data_dir.display()
-    );
+    eprintln!("Updating local NVD database in {}.", data_dir.display());
     eprintln!(
         "Calling {} without an API key; sleeping ~{}ms between requests. This can take a long time.",
         nvd::NVD_BASE,
         nvd::DEFAULT_MIN_INTERVAL.as_millis()
     );
     std::fs::create_dir_all(&data_dir)?;
-    let db = nvd::sync_from_nvd(
+    let existing = match db::load(&data_dir) {
+        Ok(db) => Some(db),
+        Err(Error::NoDb(_, _)) => None,
+        Err(e) => {
+            eprintln!("Local database unreadable ({e}); falling back to full rebuild.");
+            None
+        }
+    };
+    let db = nvd::refresh_from_nvd(
         &nvd::UreqClient,
         &nvd::StdSleeper,
         nvd::DEFAULT_MIN_INTERVAL,
+        existing,
+        force_full,
     )?;
     db::save(&data_dir, &db)?;
     eprintln!(

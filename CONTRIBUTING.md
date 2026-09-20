@@ -10,7 +10,7 @@ The maintainer reviews and merges changes. There is no promise of automatic merg
 - Do not send a CPE inventory to NVD, and do not add API-key requirements.
 - `--check` must stay offline (local JSON database only).
 - Store High and Critical CVEs only; skip Rejected (`vulnStatus` Rejected / Rejected-related).
-- `--get` must fully rebuild the local database (not an incremental merge).
+- `--get` updates the local database via a lastMod delta (upsert High/Critical, including upgrades; remove Rejected or demoted). `--get --full` forces a full rebuild.
 - Do not claim that a CPE match means a CVE is exploited.
 
 ## Before opening a PR
